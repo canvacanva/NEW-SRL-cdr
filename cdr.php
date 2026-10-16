@@ -20,11 +20,11 @@
 
 declare(strict_types=1);
 
-// NEWCOMM: DB identico su tutti i Wildix
+
 const DB_HOST = 'localhost';
 const DB_NAME = 'cdr';
 const DB_USER = 'root';
-const DB_PASS = 'PASSWORD_DB_WILDIX'; // NEWCOMM: impostare una volta, è uguale ovunque
+const DB_PASS = 'PASSWORD_DB_WILDIX'; // cambiare psw
 
 const CRED_FILE   = '/var/credentials/cdr_export.php';
 const DEST_IN     = 2;
