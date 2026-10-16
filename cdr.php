@@ -1,11 +1,10 @@
 <?php
 /**
- * cdr_export.php - NEWCOMM
+ * cdr.php - NEWCOMM
  * Export chiamate ESTERNE (effettuate / ricevute) dal DB cdr del PBX Wildix,
  * con riepilogo per ora (numero chiamate e minutaggio) oppure dettaglio.
  *
- * Il DB cdr ha la stessa struttura e le stesse credenziali su tutti i PBX Wildix,
- * quindi lo script è identico su ogni macchina. L'unica cosa per cliente è il
+ * lo script è identico su ogni macchina. L'unica cosa per cliente è il
  * login web, in /var/credentials/cdr_export.php (fuori webroot):
  *   <?php
  *   $cdrweb_user = 'report';
@@ -20,7 +19,7 @@
 
 declare(strict_types=1);
 
-
+// NEWCOMM: DB identico su tutti i Wildix
 const DB_HOST = 'localhost';
 const DB_NAME = 'cdr';
 const DB_USER = 'root';
@@ -139,6 +138,36 @@ function minutes(int $s): string
 }
 
 /**
+ * NEWCOMM: tipo del numero esterno secondo la numerazione italiana:
+ * 0... fisso, 3... mobile, +/00 non italiano estero, il resto (numeri verdi,
+ * speciali, anonimi) altro.
+ */
+function numberType(string $n): string
+{
+    $n = preg_replace('/[^\d+]/', '', $n);
+    if ($n === '') {
+        return 'Altro';
+    }
+    if (strpos($n, '+39') === 0) {
+        $n = substr($n, 3);
+    } elseif (strpos($n, '0039') === 0) {
+        $n = substr($n, 4);
+    } elseif ($n[0] === '+' || strpos($n, '00') === 0) {
+        return 'Estero';
+    }
+    if ($n === '') {
+        return 'Altro';
+    }
+    if ($n[0] === '3') {
+        return 'Mobile';
+    }
+    if ($n[0] === '0') {
+        return 'Fisso';
+    }
+    return 'Altro';
+}
+
+/**
  * Chiamate esterne nell'intervallo [from, to).
  * NEWCOMM: una stessa chiamata può generare più righe CDR con lo stesso uniqueid
  * (es. passaggi trunk -> IVR -> coda); si tiene una sola riga per chiamata,
@@ -170,6 +199,7 @@ function externalCalls(mysqli $db, string $from, string $to): Generator
             'duration'  => (int)$duration,
             'billsec'   => (int)$billsec,
         ];
+        $c['kind'] = numberType($c['dir'] === 'IN' ? $c['src'] : $c['dst']);
         $key = $c['dir'] . '|' . ($uid !== null && $uid !== '' ? $uid : uniqid('', true));
         if (!isset($calls[$key])) {
             $calls[$key] = $c;
@@ -194,7 +224,13 @@ function externalCalls(mysqli $db, string $from, string $to): Generator
 
 function emptyBucket(): array
 {
-    return ['in_tot' => 0, 'in_ans' => 0, 'in_sec' => 0, 'out_tot' => 0, 'out_ans' => 0, 'out_sec' => 0];
+    $b = [];
+    foreach (['in', 'out'] as $p) {
+        foreach (['tot', 'ans', 'sec', 'fix', 'fix_sec', 'mob', 'mob_sec'] as $k) {
+            $b[$p . '_' . $k] = 0;
+        }
+    }
+    return $b;
 }
 
 /** Riepilogo per giorno+ora o per sola fascia oraria */
@@ -215,10 +251,16 @@ function summary(Generator $calls, string $group): array
             $rows[$key] = emptyBucket();
         }
         $p = $c['dir'] === 'IN' ? 'in' : 'out';
+        $k = $c['kind'] === 'Fisso' ? 'fix' : ($c['kind'] === 'Mobile' ? 'mob' : null);
+        $sec = $c['disp'] === 'ANSWERED' ? $c['billsec'] : 0;
         $rows[$key][$p . '_tot']++;
         if ($c['disp'] === 'ANSWERED') {
             $rows[$key][$p . '_ans']++;
-            $rows[$key][$p . '_sec'] += $c['billsec'];
+            $rows[$key][$p . '_sec'] += $sec;
+        }
+        if ($k !== null) {
+            $rows[$key][$p . '_' . $k]++;
+            $rows[$key][$p . '_' . $k . '_sec'] += $sec;
         }
     }
     if ($group !== 'hour') {
@@ -232,19 +274,24 @@ function summaryHeader(string $group): array
     return [
         $group === 'hour' ? 'Fascia oraria' : 'Data e ora',
         'Effettuate', 'Effettuate risposte', 'Minuti effettuate', 'Durata effettuate',
+        'Eff. a fissi', 'Minuti eff. fissi', 'Eff. a mobili', 'Minuti eff. mobili',
         'Ricevute', 'Ricevute risposte', 'Minuti ricevute', 'Durata ricevute',
+        'Ric. da fissi', 'Minuti ric. fissi', 'Ric. da mobili', 'Minuti ric. mobili',
         'Totale chiamate', 'Minuti totali',
     ];
 }
 
 function summaryLine(string $label, array $r): array
 {
-    return [
-        $label,
-        $r['out_tot'], $r['out_ans'], minutes($r['out_sec']), secToHms($r['out_sec']),
-        $r['in_tot'], $r['in_ans'], minutes($r['in_sec']), secToHms($r['in_sec']),
-        $r['out_tot'] + $r['in_tot'], minutes($r['out_sec'] + $r['in_sec']),
-    ];
+    $line = [$label];
+    foreach (['out', 'in'] as $p) {
+        array_push($line,
+            $r[$p . '_tot'], $r[$p . '_ans'], minutes($r[$p . '_sec']), secToHms($r[$p . '_sec']),
+            $r[$p . '_fix'], minutes($r[$p . '_fix_sec']), $r[$p . '_mob'], minutes($r[$p . '_mob_sec'])
+        );
+    }
+    array_push($line, $r['out_tot'] + $r['in_tot'], minutes($r['out_sec'] + $r['in_sec']));
+    return $line;
 }
 
 function totals(array $rows): array
@@ -260,16 +307,49 @@ function totals(array $rows): array
 
 function detailHeader(): array
 {
-    return ['Data e ora', 'Direzione', 'Da', 'Nome da', 'A', 'Nome a', 'Esito',
+    return ['Data e ora', 'Direzione', 'Tipo numero', 'Da', 'Nome da', 'A', 'Nome a', 'Esito',
             'Durata totale (s)', 'Conversazione (s)', 'Minuti conversazione'];
 }
 
 function detailLine(array $c): array
 {
     return [
-        $c['start'], $c['dir'] === 'IN' ? 'Ricevuta' : 'Effettuata',
+        $c['start'], $c['dir'] === 'IN' ? 'Ricevuta' : 'Effettuata', $c['kind'],
         $c['src'], $c['from_name'], $c['dst'], $c['to_name'], $c['disp'],
         $c['duration'], $c['billsec'], minutes($c['billsec']),
+    ];
+}
+
+/** Riga di totale per il dettaglio: conteggi e minuti per direzione e tipo numero */
+function detailTotals(array $calls): array
+{
+    $t = ['IN' => [0, 0, 0, 0, 0], 'OUT' => [0, 0, 0, 0, 0]]; // tot, fissi, mobili, sec, risposte
+    foreach ($calls as $c) {
+        $d = $c['dir'];
+        $t[$d][0]++;
+        if ($c['kind'] === 'Fisso') {
+            $t[$d][1]++;
+        } elseif ($c['kind'] === 'Mobile') {
+            $t[$d][2]++;
+        }
+        if ($c['disp'] === 'ANSWERED') {
+            $t[$d][3] += $c['billsec'];
+            $t[$d][4]++;
+        }
+    }
+    return $t;
+}
+
+function detailTotalsLine(array $calls): array
+{
+    $t = detailTotals($calls);
+    return [
+        'TOTALE',
+        'Effettuate: ' . $t['OUT'][0] . ' (fissi ' . $t['OUT'][1] . ', mobili ' . $t['OUT'][2] . ', risposte ' . $t['OUT'][4] . ')',
+        'Minuti effettuate: ' . minutes($t['OUT'][3]),
+        'Ricevute: ' . $t['IN'][0] . ' (fissi ' . $t['IN'][1] . ', mobili ' . $t['IN'][2] . ', risposte ' . $t['IN'][4] . ')',
+        'Minuti ricevute: ' . minutes($t['IN'][3]),
+        'Minuti totali: ' . minutes($t['OUT'][3] + $t['IN'][3]),
     ];
 }
 
@@ -316,17 +396,21 @@ if ($logged && $action === 'export') {
             fwrite($fh, "\xEF\xBB\xBF"); // BOM per apertura corretta in Excel
 
             if ($fType === 'detail') {
+                $calls = iterator_to_array(externalCalls($db, $sqlFrom, $sqlTo), false);
+                // NEWCOMM: totale in alto
+                fputcsv($fh, detailTotalsLine($calls), ';');
+                fputcsv($fh, [], ';');
                 fputcsv($fh, detailHeader(), ';');
-                foreach (externalCalls($db, $sqlFrom, $sqlTo) as $c) {
+                foreach ($calls as $c) {
                     fputcsv($fh, detailLine($c), ';');
                 }
             } else {
                 $rows = summary(externalCalls($db, $sqlFrom, $sqlTo), $fGroup);
                 fputcsv($fh, summaryHeader($fGroup), ';');
+                fputcsv($fh, summaryLine('TOTALE', totals($rows)), ';'); // NEWCOMM: totale in alto
                 foreach ($rows as $label => $r) {
                     fputcsv($fh, summaryLine($label, $r), ';');
                 }
-                fputcsv($fh, summaryLine('TOTALE', totals($rows)), ';');
             }
             fclose($fh);
             $db->close();
@@ -335,14 +419,10 @@ if ($logged && $action === 'export') {
 
         if ($db) {
             if ($fType === 'detail') {
-                $list = [];
-                $count = 0;
-                foreach (externalCalls($db, $sqlFrom, $sqlTo) as $c) {
-                    if (++$count <= PREVIEW_MAX) {
-                        $list[] = detailLine($c);
-                    }
-                }
-                $preview = ['head' => detailHeader(), 'rows' => $list, 'count' => $count];
+                $calls = iterator_to_array(externalCalls($db, $sqlFrom, $sqlTo), false);
+                $list  = array_map('detailLine', array_slice($calls, 0, PREVIEW_MAX));
+                $preview = ['head' => detailHeader(), 'rows' => $list, 'count' => count($calls),
+                            'dtot' => detailTotals($calls)];
             } else {
                 $rows  = summary(externalCalls($db, $sqlFrom, $sqlTo), $fGroup);
                 $lines = [];
@@ -410,7 +490,8 @@ th, td { padding: 6px 10px; border-bottom: 1px solid var(--line); text-align: ri
 th:first-child, td:first-child { text-align: left; }
 th { font-weight: 600; color: var(--muted); position: sticky; top: 0; background: var(--panel); }
 td.in { color: var(--in); } td.out { color: var(--out); }
-tfoot td { font-weight: 600; border-top: 2px solid var(--line); }
+tr.total td { font-weight: 600; border-bottom: 2px solid var(--line); background: var(--bg); }
+table.totals { width: auto; margin-bottom: 8px; }
 </style>
 </head>
 <body>
@@ -478,7 +559,15 @@ tfoot td { font-weight: 600; border-top: 2px solid var(--line); }
 
         <?php if ($preview): ?>
             <div class="tablewrap">
-            <?php if ($fType === 'detail'): ?>
+            <?php if ($fType === 'detail'): $t = $preview['dtot']; ?>
+                <table class="totals">
+                    <thead><tr><th></th><th>Chiamate</th><th>Risposte</th><th>Da/a fissi</th><th>Da/a mobili</th><th>Minuti</th></tr></thead>
+                    <tbody>
+                        <tr><td class="out">Effettuate</td><td><?= $t['OUT'][0] ?></td><td><?= $t['OUT'][4] ?></td><td><?= $t['OUT'][1] ?></td><td><?= $t['OUT'][2] ?></td><td><?= minutes($t['OUT'][3]) ?></td></tr>
+                        <tr><td class="in">Ricevute</td><td><?= $t['IN'][0] ?></td><td><?= $t['IN'][4] ?></td><td><?= $t['IN'][1] ?></td><td><?= $t['IN'][2] ?></td><td><?= minutes($t['IN'][3]) ?></td></tr>
+                        <tr class="total"><td>Totale</td><td><?= $t['OUT'][0] + $t['IN'][0] ?></td><td><?= $t['OUT'][4] + $t['IN'][4] ?></td><td><?= $t['OUT'][1] + $t['IN'][1] ?></td><td><?= $t['OUT'][2] + $t['IN'][2] ?></td><td><?= minutes($t['OUT'][3] + $t['IN'][3]) ?></td></tr>
+                    </tbody>
+                </table>
                 <p class="note"><?= $preview['count'] ?> chiamate esterne nel periodo<?= $preview['count'] > PREVIEW_MAX ? ', mostrate le prime ' . PREVIEW_MAX . ': scarica il CSV per l\'elenco completo' : '' ?>.</p>
             <?php endif; ?>
             <?php if (!$preview['rows'] || ($fType === 'detail' && !$preview['count'])): ?>
@@ -487,6 +576,9 @@ tfoot td { font-weight: 600; border-top: 2px solid var(--line); }
                 <table>
                     <thead><tr><?php foreach ($preview['head'] as $c): ?><th><?= h($c) ?></th><?php endforeach; ?></tr></thead>
                     <tbody>
+                    <?php if (isset($preview['total'])): // NEWCOMM: totale in alto ?>
+                        <tr class="total"><?php foreach ($preview['total'] as $v): ?><td><?= h($v) ?></td><?php endforeach; ?></tr>
+                    <?php endif; ?>
                     <?php foreach ($preview['rows'] as $r): ?>
                         <tr><?php foreach ($r as $i => $v):
                             $cls = '';
@@ -494,9 +586,6 @@ tfoot td { font-weight: 600; border-top: 2px solid var(--line); }
                         ?><td class="<?= $cls ?>"><?= h($v) ?></td><?php endforeach; ?></tr>
                     <?php endforeach; ?>
                     </tbody>
-                    <?php if (isset($preview['total'])): ?>
-                        <tfoot><tr><?php foreach ($preview['total'] as $v): ?><td><?= h($v) ?></td><?php endforeach; ?></tr></tfoot>
-                    <?php endif; ?>
                 </table>
             <?php endif; ?>
             </div>
