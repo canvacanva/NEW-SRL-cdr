@@ -1,5 +1,27 @@
 Login come root
 
+Creare file credenziali
+```
+mkdir /var/credentials
+cd /var/credentials
+```
+
+Creare una hash per la password web
+```
+php -r "echo password_hash('LA_PASSWORD', PASSWORD_DEFAULT), PHP_EOL;"
+```
+
+creare il file di credenziali
+```
+nano /var/credentials/cdr_export.php
+```
+
+copiare il contenuto su cdr_export.php ed scegiere user e password
+```
+<?php
+$cdrweb_user = 'report';
+$cdrweb_hash = '...';
+```
 ```
 mkdir /var/www/_newsrl
 cd /var/www/_newsrl
