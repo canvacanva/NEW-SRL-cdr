@@ -36,3 +36,4 @@ const DB_NAME = 'cdr';
 const DB_USER = 'root';
 const DB_PASS = 'PASSWORD_DB_WILDIX';
 ```
+Accedere alla pagina web del cliente https://%dominio%.wildixin.com/_newsrl/cdr.php
